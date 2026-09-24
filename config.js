@@ -1,3 +1,3 @@
 window.PORTFOLIO_APP_CONFIG = {
-  apiBaseUrl: "http://localhost:3000"
+  apiBaseUrl: "https://minimal-dev-portfolio-1.onrender.com"
 };
