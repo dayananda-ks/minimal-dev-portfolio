@@ -1,0 +1,10 @@
+backend/node_modules/
+backend/.env
+backend/.env.*
+!backend/.env.example
+backend/data/*.sqlite
+backend/data/*.sqlite-*
+backend/data/*.db
+.vscode/
+*.log
+.DS_Store

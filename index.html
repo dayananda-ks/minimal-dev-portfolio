@@ -151,6 +151,9 @@
             text-decoration: none;
             font-weight: 500;
             transition: all 0.3s ease;
+            border: none;
+            cursor: pointer;
+            font: inherit;
         }
 
         .btn-primary {
@@ -174,6 +177,38 @@
         .btn-secondary:hover {
             background-color: var(--secondary-color);
             color: #fff;
+        }
+
+        .btn.is-loading,
+        .btn:disabled {
+            opacity: 0.72;
+            cursor: not-allowed;
+        }
+
+        .resume-status {
+            margin-top: 1rem;
+            font-size: 0.95rem;
+            min-height: 1.4rem;
+        }
+
+        .resume-status[data-tone="success"] {
+            color: #1f7a3f;
+        }
+
+        .resume-status[data-tone="error"] {
+            color: #b42318;
+        }
+
+        .resume-actions {
+            margin-top: 1rem;
+            display: flex;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .resume-actions[hidden] {
+            display: none;
         }
 
         .hero-socials {
@@ -426,7 +461,12 @@
                 <p class="hero-tagline">Technical Lead of the Open Source Club at my college, interning at two places simultaneously. I write clean code, think in systems, and learn by building.</p>
                 <div class="hero-buttons">
                     <a href="#projects" class="btn btn-primary">View Projects &rarr;</a>
-                    <a href="resume.pdf" class="btn btn-secondary" download>Download Resume</a>
+                    <button type="button" class="btn btn-secondary" id="resumeActionButton">Download Resume</button>
+                </div>
+                <p class="resume-status" id="resumeStatus" aria-live="polite" hidden></p>
+                <div class="resume-actions" id="resumeUnlockedActions" hidden>
+                    <button type="button" class="btn btn-primary" id="viewResumeButton">View Resume</button>
+                    <button type="button" class="btn btn-secondary" id="downloadResumeButton">Download Resume</button>
                 </div>
                 <div class="hero-socials">
                     <a href="https://github.com/dayananda-ks" target="_blank"><img src="images/github.jpeg" alt="GitHub"></a>
@@ -675,12 +715,306 @@
         </div>
     </footer>
 
+    <script src="config.js"></script>
     <script>
         document.addEventListener('DOMContentLoaded', () => {
             const hamburger = document.querySelector('.hamburger');
             const navLinks = document.querySelector('.nav-links');
             const links = document.querySelectorAll('.nav-links li a');
             const navbar = document.querySelector('.navbar');
+            const resumeActionButton = document.querySelector('#resumeActionButton');
+            const resumeStatus = document.querySelector('#resumeStatus');
+            const resumeUnlockedActions = document.querySelector('#resumeUnlockedActions');
+            const viewResumeButton = document.querySelector('#viewResumeButton');
+            const downloadResumeButton = document.querySelector('#downloadResumeButton');
+            const appConfig = window.PORTFOLIO_APP_CONFIG || {};
+            const apiBaseUrl = (appConfig.apiBaseUrl || 'http://localhost:3001').replace(/\/$/, '');
+            const resumeStorageKey = 'portfolioResumeAccess';
+            const resumeDownloadPendingKey = 'portfolioResumeDownloadPending';
+            let resumeAccess = null;
+            let resumeFlowBusy = false;
+
+            function setResumeStatus(message, tone) {
+                resumeStatus.textContent = message || '';
+                resumeStatus.dataset.tone = tone || 'info';
+                resumeStatus.hidden = !message;
+            }
+
+            function setResumeButtonState(isLoading) {
+                resumeActionButton.disabled = isLoading;
+                resumeActionButton.classList.toggle('is-loading', isLoading);
+                resumeActionButton.textContent = isLoading ? 'Creating secure checkout...' : 'Download Resume';
+            }
+
+            function persistAccess(accessToken, accessExpiresAt) {
+                resumeAccess = { accessToken, accessExpiresAt };
+                sessionStorage.setItem(resumeStorageKey, JSON.stringify(resumeAccess));
+            }
+
+            function clearAccess() {
+                resumeAccess = null;
+                sessionStorage.removeItem(resumeStorageKey);
+                resumeUnlockedActions.hidden = true;
+            }
+
+            function formatExpiry(accessExpiresAt) {
+                const expiryDate = new Date(accessExpiresAt);
+                return expiryDate.toLocaleString();
+            }
+
+            function hasResumeToken() {
+                return Boolean(resumeAccess && resumeAccess.accessToken);
+            }
+
+            async function apiRequest(path, options = {}) {
+                const response = await fetch(`${apiBaseUrl}${path}`, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        ...(options.headers || {})
+                    },
+                    ...options
+                });
+
+                const payload = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    const message = payload?.error?.message || 'Something went wrong while contacting the payment service.';
+                    throw new Error(message);
+                }
+
+                return payload;
+            }
+
+            async function loadRazorpayScript() {
+                if (window.Razorpay) {
+                    return;
+                }
+
+                await new Promise((resolve, reject) => {
+                    const script = document.createElement('script');
+                    script.src = 'https://checkout.razorpay.com/v1/checkout.js';
+                    script.async = true;
+                    script.onload = resolve;
+                    script.onerror = () => reject(new Error('Unable to load Razorpay checkout.'));
+                    document.head.appendChild(script);
+                });
+            }
+
+            async function fetchResumeBlob(disposition) {
+                if (!hasResumeToken()) {
+                    throw new Error('Resume access is missing. Complete the payment flow to unlock the resume.');
+                }
+
+                const response = await fetch(`${apiBaseUrl}/api/resume/access?disposition=${encodeURIComponent(disposition)}`, {
+                    headers: {
+                        Authorization: `Bearer ${resumeAccess.accessToken}`
+                    }
+                });
+
+                if (!response.ok) {
+                    const payload = await response.json().catch(() => ({}));
+                    if (response.status === 401 || response.status === 403) {
+                        clearAccess();
+                    }
+                    throw new Error(payload?.error?.message || 'Unable to load the protected resume.');
+                }
+
+                return response.blob();
+            }
+
+            async function openResumeInNewTab() {
+                try {
+                    const blob = await fetchResumeBlob('inline');
+                    const objectUrl = URL.createObjectURL(blob);
+                    const newWindow = window.open(objectUrl, '_blank', 'noopener,noreferrer');
+
+                    if (!newWindow) {
+                        throw new Error('Pop-up blocked. Allow pop-ups to view the resume.');
+                    }
+
+                    setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+                } catch (error) {
+                    setResumeStatus(error.message, 'error');
+                }
+            }
+
+            async function downloadProtectedResume() {
+                try {
+                    const blob = await fetchResumeBlob('attachment');
+                    const objectUrl = URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = objectUrl;
+                    link.download = 'Dayananda-KS-Resume.pdf';
+                    document.body.appendChild(link);
+                    link.click();
+                    link.remove();
+                    setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+                    sessionStorage.removeItem(resumeDownloadPendingKey);
+                    return true;
+                } catch (error) {
+                    setResumeStatus(error.message, 'error');
+                    return false;
+                }
+            }
+
+            async function verifyPayment(paymentResponse) {
+                return apiRequest('/api/payments/verify', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        razorpay_order_id: paymentResponse.razorpay_order_id,
+                        razorpay_payment_id: paymentResponse.razorpay_payment_id,
+                        razorpay_signature: paymentResponse.razorpay_signature
+                    })
+                });
+            }
+
+            function showUnlockedState(accessToken, accessExpiresAt) {
+                persistAccess(accessToken, accessExpiresAt);
+                resumeUnlockedActions.hidden = false;
+                setResumeStatus(`Payment verified. Resume access is unlocked until ${formatExpiry(accessExpiresAt)}.`, 'success');
+                setResumeButtonState(false);
+            }
+
+            async function startPaymentFlow() {
+                if (resumeFlowBusy) {
+                    return;
+                }
+
+                resumeFlowBusy = true;
+                setResumeButtonState(true);
+                setResumeStatus('Creating a secure ₹10 checkout...', 'info');
+
+                try {
+                    await loadRazorpayScript();
+
+                    const orderResponse = await apiRequest('/api/payments/create-order', {
+                        method: 'POST',
+                        body: JSON.stringify({ purpose: 'resume_access' })
+                    });
+
+                    sessionStorage.setItem(resumeDownloadPendingKey, 'true');
+                    const checkout = new window.Razorpay({
+                        key: orderResponse.keyId,
+                        amount: orderResponse.order.amount,
+                        currency: orderResponse.order.currency,
+                        name: orderResponse.businessName,
+                        description: orderResponse.description,
+                        order_id: orderResponse.order.id,
+                        callback_url: apiBaseUrl.startsWith('https://') ? `${apiBaseUrl}/api/payments/callback` : undefined,
+                        redirect: apiBaseUrl.startsWith('https://'),
+                        theme: {
+                            color: '#3498db'
+                        },
+                        modal: {
+                            ondismiss: () => {
+                                if (!hasResumeToken()) {
+                                    setResumeStatus('Payment cancelled. You can try again when ready.', 'error');
+                                }
+                                setResumeButtonState(false);
+                                resumeFlowBusy = false;
+                            }
+                        },
+                        handler: async (paymentResponse) => {
+                            try {
+                                setResumeStatus('Verifying payment securely on the server...', 'info');
+                                const verification = await verifyPayment(paymentResponse);
+                                showUnlockedState(verification.accessToken, verification.accessExpiresAt);
+                                setResumeStatus('Payment verified. Downloading your resume...', 'success');
+                                await downloadProtectedResume();
+                            } catch (error) {
+                                setResumeStatus(error.message, 'error');
+                                setResumeButtonState(false);
+                            } finally {
+                                resumeFlowBusy = false;
+                            }
+                        }
+                    });
+
+                    checkout.on('payment.failed', (failure) => {
+                        sessionStorage.removeItem(resumeDownloadPendingKey);
+                        const message = failure?.error?.description || 'Payment failed. Please try again.';
+                        setResumeStatus(message, 'error');
+                        setResumeButtonState(false);
+                        resumeFlowBusy = false;
+                    });
+
+                    checkout.open();
+                } catch (error) {
+                    setResumeStatus(error.message, 'error');
+                    setResumeButtonState(false);
+                    resumeFlowBusy = false;
+                }
+            }
+
+            function hydrateStoredAccess() {
+                const storedAccess = sessionStorage.getItem(resumeStorageKey);
+                if (!storedAccess) {
+                    return;
+                }
+
+                try {
+                    const parsedAccess = JSON.parse(storedAccess);
+                    if (!parsedAccess || !parsedAccess.accessToken) {
+                        clearAccess();
+                        return;
+                    }
+
+                    resumeAccess = parsedAccess;
+                } catch {
+                    clearAccess();
+                }
+            }
+
+            async function validateStoredAccess() {
+                if (!hasResumeToken()) {
+                    return;
+                }
+
+                try {
+                    const response = await fetch(`${apiBaseUrl}/api/resume/access-status`, {
+                        headers: {
+                            Authorization: `Bearer ${resumeAccess.accessToken}`
+                        }
+                    });
+
+                    const payload = await response.json();
+                    if (!response.ok || !payload.accessGranted) {
+                        clearAccess();
+                        return;
+                    }
+
+                    showUnlockedState(resumeAccess.accessToken, payload.accessExpiresAt || resumeAccess.accessExpiresAt);
+                    if (sessionStorage.getItem(resumeDownloadPendingKey) === 'true') {
+                        await downloadProtectedResume();
+                    }
+                } catch {
+                    clearAccess();
+                }
+            }
+
+            resumeActionButton.addEventListener('click', async () => {
+                if (hasResumeToken()) {
+                    try {
+                        const response = await fetch(`${apiBaseUrl}/api/resume/access-status`, {
+                            headers: {
+                                Authorization: `Bearer ${resumeAccess.accessToken}`
+                            }
+                        });
+                        const payload = await response.json().catch(() => ({}));
+                        if (response.ok && payload.accessGranted) {
+                            await downloadProtectedResume();
+                            return;
+                        }
+                    } catch {
+                        // A stale access token should not prevent a new payment attempt.
+                    }
+                    clearAccess();
+                }
+
+                await startPaymentFlow();
+            });
+
+            viewResumeButton.addEventListener('click', openResumeInNewTab);
+            downloadResumeButton.addEventListener('click', downloadProtectedResume);
 
             // Toggle mobile navigation
             hamburger.addEventListener('click', () => {
@@ -712,13 +1046,47 @@
             // Smooth scrolling for anchor links
             document.querySelectorAll('a[href^="#"]').forEach(anchor => {
                 anchor.addEventListener('click', function (e) {
+                    const targetSelector = this.getAttribute('href');
+                    if (!targetSelector || targetSelector === '#') {
+                        return;
+                    }
+
                     e.preventDefault();
 
-                    document.querySelector(this.getAttribute('href')).scrollIntoView({
+                    const targetElement = document.querySelector(targetSelector);
+                    if (!targetElement) {
+                        return;
+                    }
+
+                    targetElement.scrollIntoView({
                         behavior: 'smooth'
                     });
                 });
             });
+
+            const callbackParams = new URLSearchParams(window.location.hash.slice(1));
+            const callbackToken = callbackParams.get('resume_token');
+            if (callbackToken) {
+                window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+                setResumeStatus('Confirming your payment and preparing the resume...', 'info');
+                fetch(`${apiBaseUrl}/api/resume/access-status`, {
+                    headers: { Authorization: `Bearer ${callbackToken}` }
+                })
+                    .then((response) => response.json())
+                    .then(async (payload) => {
+                        if (!payload.accessGranted || !payload.accessExpiresAt) {
+                            throw new Error('Payment was not confirmed by the server. Contact support before paying again.');
+                        }
+                        persistAccess(callbackToken, payload.accessExpiresAt);
+                        showUnlockedState(callbackToken, payload.accessExpiresAt);
+                        setResumeStatus('Payment verified. Downloading your resume...', 'success');
+                        await downloadProtectedResume();
+                    })
+                    .catch((error) => setResumeStatus(error.message, 'error'));
+            } else {
+                hydrateStoredAccess();
+                validateStoredAccess();
+            }
         });
     </script>
 </body>
